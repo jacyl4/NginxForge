@@ -1,0 +1,490 @@
+#!/bin/bash
+
+# 版本配置
+NGINX_VERSION="1.27.5"
+PCRE_VERSION="8.45"
+ZLIB_VERSION="1.3.1"
+LUAJIT_VERSION="2.1-20231117"
+
+# 路径配置
+BUILD_DIR="$(pwd)"                          # 构建目录
+NGINX_SOURCE_DIR="${BUILD_DIR}/nginx-${NGINX_VERSION}" # Nginx源代码目录
+
+# 标志变量 - 用于跟踪已完成的步骤
+PCRE_COMPILED=false
+ZLIB_COMPILED=false
+LUAJIT_COMPILED=false
+MODULES_CLONED=false
+
+# 颜色定义 - 使用tput进行更好的兼容性
+if [ -t 1 ]; then
+  # 终端颜色
+  readonly COLOR_RESET=$(tput sgr0)
+  readonly COLOR_INFO=$(tput setaf 6)    # 青色 - 信息
+  readonly COLOR_SUCCESS=$(tput setaf 2) # 绿色 - 成功
+  readonly COLOR_WARNING=$(tput setaf 3) # 黄色 - 警告
+  readonly COLOR_ERROR=$(tput setaf 1)   # 红色 - 错误
+  readonly COLOR_BOLD=$(tput bold)       # 粗体
+else
+  # 非终端不使用颜色
+  readonly COLOR_RESET=""
+  readonly COLOR_INFO=""
+  readonly COLOR_SUCCESS=""
+  readonly COLOR_WARNING=""
+  readonly COLOR_ERROR=""
+  readonly COLOR_BOLD=""
+fi
+
+# 日志函数
+log_info() {
+    echo -e "${COLOR_INFO}${1}${COLOR_RESET}"
+}
+
+log_success() {
+    echo -e "${COLOR_BOLD}[${COLOR_SUCCESS}✓${COLOR_BOLD}]${COLOR_RESET}\t${1}"
+}
+
+log_warning() {
+    echo -e "${COLOR_WARNING}${1}${COLOR_RESET}"
+}
+
+log_error() {
+    echo -e "${COLOR_ERROR}${1}${COLOR_RESET}" >&2
+}
+
+# 创建必要目录
+create_directories() {
+    log_info "创建必要目录..."
+    mkdir -p "/etc/nginx/conf.d"
+    mkdir -p /var/log/nginx
+    mkdir -p /var/cache/nginx/{client_temp,proxy_temp,fastcgi_temp,uwsgi_temp,scgi_temp}
+    
+    log_success "系统目录创建完成"
+}
+
+# 安装系统依赖
+install_dependencies() {
+    log_info "安装系统依赖..."
+    apt update
+    
+    # 直接安装所有需要的依赖
+    apt install -y --no-install-recommends --no-install-suggests \
+        ca-certificates wget curl git build-essential libtool \
+        autoconf libssl-dev libperl-dev libpcre3-dev zlib1g-dev \
+        libatomic-ops-dev libxslt-dev libbrotli-dev \
+        libmimalloc2.0 libmimalloc-dev
+}
+
+# 编译安装PCRE
+install_pcre() {
+    log_info "检查PCRE..."
+    
+    # 检查PCRE是否已安装
+    if pcre-config --version 2>/dev/null | grep -q "$PCRE_VERSION"; then
+        log_success "PCRE $PCRE_VERSION 已安装，跳过编译"
+        PCRE_COMPILED=true
+        return 0
+    fi
+    
+    # 检查源码是否已下载
+    if [ -d "pcre-$PCRE_VERSION" ]; then
+        log_info "PCRE源码已下载，继续编译"
+    else
+        log_info "下载PCRE源码..."
+        rm -rf /tmp/pcre.tar.gz pcre-*
+        wget --no-check-certificate -qO /tmp/pcre.tar.gz \
+            http://ftp.exim.org/pub/pcre/pcre-$PCRE_VERSION.tar.gz
+        tar -zxf /tmp/pcre.tar.gz
+    fi
+    
+    log_info "编译安装PCRE..."
+    cd pcre-$PCRE_VERSION || exit 1
+    
+    # 检查是否已配置
+    if [ ! -f "Makefile" ]; then
+./configure
+    fi
+    
+    make -j "$(nproc)" && make install
+    cd ..
+    PCRE_COMPILED=true
+    log_success "PCRE编译安装完成"
+}
+
+# 编译安装ZLIB
+install_zlib() {
+    log_info "检查ZLIB..."
+    
+    # 尝试检测已安装的ZLIB版本
+    local current_zlib_version=$(grep "ZLIB_VERSION" /usr/local/include/zlib.h 2>/dev/null | grep -oP '"\K[^"]+')
+    
+    if [ "$current_zlib_version" = "$ZLIB_VERSION" ]; then
+        log_success "ZLIB $ZLIB_VERSION 已安装，跳过编译"
+        ZLIB_COMPILED=true
+        return 0
+    fi
+    
+    # 检查源码是否已下载
+    if [ -d "zlib-$ZLIB_VERSION" ]; then
+        log_info "ZLIB源码已下载，继续编译"
+    else
+        log_info "下载ZLIB源码..."
+        rm -rf /tmp/zlib.tar.gz zlib-*
+        wget --no-check-certificate -qO /tmp/zlib.tar.gz \
+            https://zlib.net/fossils/zlib-$ZLIB_VERSION.tar.gz
+        tar -zxf /tmp/zlib.tar.gz
+    fi
+    
+    log_info "编译安装ZLIB..."
+    cd zlib-$ZLIB_VERSION || exit 1
+    
+    # 检查是否已配置
+    if [ ! -f "Makefile" ]; then
+./configure --prefix=/usr/local
+    fi
+    
+    make -j "$(nproc)" && make install
+    cd ..
+    ZLIB_COMPILED=true
+    log_success "ZLIB编译安装完成"
+}
+
+# 安装LuaJIT
+install_luajit() {
+    log_info "检查LuaJIT..."
+    
+    # 检查LuaJIT是否已安装
+    if [ -f "/usr/local/lib/libluajit-5.1.so" ] && \
+       [ -d "/usr/local/include/luajit-2.1" ]; then
+        log_success "LuaJIT 已安装，跳过编译"
+        
+        # 设置LuaJIT环境变量
+        export LUAJIT_LIB=/usr/local/lib
+        export LUAJIT_INC=/usr/local/include/luajit-2.1
+        
+        LUAJIT_COMPILED=true
+        return 0
+    fi
+    
+    # 检查源码是否已下载
+    if ls -d luajit2-* >/dev/null 2>&1; then
+        log_info "LuaJIT源码已下载，继续编译"
+    else
+        log_info "下载LuaJIT源码..."
+        rm -rf /tmp/luajit.tar.gz luajit2-*
+        wget --no-check-certificate -qO /tmp/luajit.tar.gz \
+            https://github.com/openresty/luajit2/archive/v$LUAJIT_VERSION.tar.gz
+        tar -zxf /tmp/luajit.tar.gz
+    fi
+    
+    log_info "编译安装LuaJIT..."
+    cd luajit2-* || exit 1
+    make -j "$(nproc)" && make install
+    
+    # 创建符号链接确保库能被找到
+    ln -sf /usr/local/lib/libluajit-5.1.so.2 /usr/lib/$(uname -m)-linux-gnu/
+    ldconfig
+    
+    cd "${BUILD_DIR}"
+    
+    # 验证安装
+    if [ ! -f "/usr/local/lib/libluajit-5.1.so" ]; then
+        log_error "LuaJIT库未找到，Lua模块可能无法使用"
+        LUAJIT_COMPILED=false
+        return 1
+    fi
+    
+    # 设置LuaJIT环境变量
+    export LUAJIT_LIB=/usr/local/lib
+    export LUAJIT_INC=/usr/local/include/luajit-2.1
+    
+    LUAJIT_COMPILED=true
+    log_success "LuaJIT编译安装完成"
+}
+
+# 克隆必要的模块
+clone_modules() {
+    log_info "检查必要模块..."
+    
+    # 所有必需模块
+    local modules=(
+        "ngx_brotli"
+        "zstd-nginx-module"
+        "openssl"
+        "lua-nginx-module"
+        "ngx_devel_kit"
+    )
+    
+    # 检查模块是否已克隆
+    local all_modules_exist=true
+    for module in "${modules[@]}"; do
+        if [ ! -d "$module" ]; then
+            all_modules_exist=false
+            break
+        fi
+    done
+    
+    if $all_modules_exist; then
+        log_success "所有必要模块已克隆，跳过克隆步骤"
+        MODULES_CLONED=true
+        return 0
+    fi
+    
+    log_info "克隆必要模块..."
+    
+    [ ! -d "ngx_brotli" ] && git clone --depth=1 --recurse-submodules https://github.com/google/ngx_brotli
+    [ ! -d "zstd-nginx-module" ] && git clone --depth=1 --recurse-submodules https://github.com/tokers/zstd-nginx-module
+    [ ! -d "openssl" ] && git clone --depth=1 --recursive https://github.com/quictls/openssl
+    [ ! -d "lua-nginx-module" ] && git clone --depth=1 https://github.com/openresty/lua-nginx-module
+    [ ! -d "ngx_devel_kit" ] && git clone --depth=1 https://github.com/vision5/ngx_devel_kit
+    
+    MODULES_CLONED=true
+    log_success "所有模块克隆完成"
+}
+
+# 检查configure支持的选项
+check_configure_options() {
+    log_info "检查Nginx配置选项..."
+    
+    # 如果目录不存在，无法检查
+    if [ ! -d "${NGINX_SOURCE_DIR}" ]; then
+        log_warning "Nginx源码目录不存在，无法检查配置选项"
+        return 1
+    fi
+    
+    # 保存当前目录
+    local current_dir="$(pwd)"
+    
+    # 进入Nginx源码目录
+    cd "${NGINX_SOURCE_DIR}" || exit 1
+    
+    # 检查configure文件是否存在
+    if [ ! -f "./configure" ]; then
+        log_error "configure脚本未找到: ${NGINX_SOURCE_DIR}/configure"
+        cd "${current_dir}"
+        return 1
+    fi
+    
+    # 避免重复生成帮助信息
+    if [ ! -f "/tmp/nginx_configure_help.txt" ]; then
+        ./configure --help > /tmp/nginx_configure_help.txt 2>/dev/null
+    fi
+    
+    # 检查是否支持http_grpc_module
+    if grep -q "with-http_grpc_module" /tmp/nginx_configure_help.txt; then
+        log_success "支持--with-http_grpc_module选项"
+        SUPPORT_GRPC_MODULE=true
+    else
+        log_warning "不支持--with-http_grpc_module选项，将使用stream模块和http/2支持代替"
+        SUPPORT_GRPC_MODULE=false
+    fi
+    
+    # 返回原目录
+    cd "${current_dir}"
+    return 0
+}
+
+# 编译nginx
+compile_nginx() {
+    log_info "检查Nginx编译状态..."
+    
+    # 检查Nginx二进制文件是否已编译并且是最新版本
+    if [ -f "${NGINX_SOURCE_DIR}/objs/nginx" ]; then
+        local compiled_version=$(${NGINX_SOURCE_DIR}/objs/nginx -v 2>&1 | grep -oP "nginx/\K[0-9.]+")
+        if [ "$compiled_version" = "$NGINX_VERSION" ]; then
+            log_success "Nginx $NGINX_VERSION 已编译，跳过编译步骤"
+            return 0
+        fi
+    fi
+    
+    # 检查源码是否已下载
+    if [ -d "${NGINX_SOURCE_DIR}" ]; then
+        log_info "Nginx源码已下载，继续编译"
+    else
+        log_info "下载Nginx源码..."
+        rm -rf /tmp/nginx.tar.gz nginx-*
+        wget --no-check-certificate -qO /tmp/nginx.tar.gz \
+            https://nginx.org/download/nginx-$NGINX_VERSION.tar.gz
+        tar -zxf /tmp/nginx.tar.gz
+        
+        # 验证源码目录
+        if [ ! -d "${NGINX_SOURCE_DIR}" ]; then
+            log_error "Nginx源码目录未创建: ${NGINX_SOURCE_DIR}"
+            exit 1
+        fi
+        
+        # 验证configure文件
+        if [ ! -f "${NGINX_SOURCE_DIR}/configure" ]; then
+            log_error "configure脚本未找到: ${NGINX_SOURCE_DIR}/configure"
+            exit 1
+        fi
+    fi
+    
+    # 修改编译器标志
+    sed -i 's/CFLAGS="$CFLAGS -g"/#CFLAGS="$CFLAGS -g"/' ${NGINX_SOURCE_DIR}/auto/cc/gcc
+    
+    # 保存当前目录
+    local current_dir="$(pwd)"
+    
+    # 进入Nginx源码目录
+    cd "${NGINX_SOURCE_DIR}" || exit 1
+    
+    # 应用补丁
+    if ! grep -q "dynamic_tls_records" src/event/ngx_event_openssl.c; then
+        log_info "应用动态TLS记录补丁..."
+        curl -s https://raw.githubusercontent.com/kn007/patch/master/nginx_dynamic_tls_records.patch | patch -p01
+    fi
+    
+    if ! grep -q "use_openssl_md5_sha1" auto/lib/openssl/conf; then
+        log_info "应用OpenSSL MD5/SHA1补丁..."
+        curl -s https://raw.githubusercontent.com/kn007/patch/master/use_openssl_md5_sha1.patch | patch -p01
+    fi
+    
+    # 检查配置选项
+    check_configure_options
+    
+    log_info "配置Nginx..."
+    ./configure \
+      --prefix=/etc/nginx \
+      --sbin-path=/usr/sbin/nginx \
+      --modules-path=/usr/lib/nginx/modules \
+      --conf-path=/etc/nginx/nginx.conf \
+      --error-log-path=/var/log/nginx/error.log \
+      --http-log-path=/var/log/nginx/access.log \
+      --pid-path=/run/nginx.pid \
+      --lock-path=/run/nginx.lock \
+      --http-client-body-temp-path=/var/cache/nginx/client_temp \
+      --http-proxy-temp-path=/var/cache/nginx/proxy_temp \
+      --http-fastcgi-temp-path=/var/cache/nginx/fastcgi_temp \
+      --http-uwsgi-temp-path=/var/cache/nginx/uwsgi_temp \
+      --http-scgi-temp-path=/var/cache/nginx/scgi_temp \
+      --user=www-data \
+      --group=www-data \
+      --with-compat \
+      --with-file-aio \
+      --with-threads \
+      --with-libatomic \
+      --with-http_ssl_module \
+      --with-http_v2_module \
+      --with-http_v3_module \
+      --with-http_realip_module \
+      --with-http_addition_module \
+      --with-http_sub_module \
+      --with-http_dav_module \
+      --with-http_flv_module \
+      --with-http_mp4_module \
+      --with-http_gunzip_module \
+      --with-http_gzip_static_module \
+      --with-http_auth_request_module \
+      --with-http_random_index_module \
+      --with-http_secure_link_module \
+      --with-http_degradation_module \
+      --with-http_slice_module \
+      --with-http_stub_status_module \
+      --with-http_xslt_module=dynamic \
+      --with-http_perl_module=dynamic \
+      --with-stream \
+      --with-stream_ssl_module \
+      --with-stream_ssl_preread_module \
+      --with-stream_realip_module \
+      --with-pcre-jit \
+      --with-pcre=${BUILD_DIR}/pcre-$PCRE_VERSION \
+      --with-zlib=${BUILD_DIR}/zlib-$ZLIB_VERSION \
+      --add-module=${BUILD_DIR}/ngx_brotli \
+      --add-module=${BUILD_DIR}/ngx_devel_kit \
+      --add-module=${BUILD_DIR}/lua-nginx-module \
+      --with-openssl=${BUILD_DIR}/openssl \
+      --with-openssl-opt="enable-ktls enable-ec_nistp_64_gcc_128" \
+      --with-cc-opt='-g -O3 -pipe -Wformat -Werror=format-security -Wp,-D_FORTIFY_SOURCE=2 -fexceptions -fstack-protector-strong --param=ssp-buffer-size=4 -DTCP_FASTOPEN=23 -mtune=generic -fPIC' \
+      --with-ld-opt="-Wl,-Bsymbolic-functions -flto=auto -ffat-lto-objects -Wl,-z,relro -Wl,-z,now -Wl,-E -Wl,--as-needed -fPIC -L /usr/lib/$(uname -m)-linux-gnu -lmimalloc"
+
+    log_info "编译Nginx..."
+    make
+    
+    # 验证编译结果
+    if [ ! -f "objs/nginx" ]; then
+        log_error "Nginx编译失败，未找到编译结果"
+        cd "${current_dir}"
+        return 1
+    fi
+    
+    # 回到构建目录
+    cd "${current_dir}"
+    
+    log_success "Nginx编译完成"
+}
+
+# 复制编译好的二进制文件
+copy_nginx_binary() {
+    local source_binary="${NGINX_SOURCE_DIR}/objs/nginx"
+    local target_binary="${BUILD_DIR}/nginx"
+    
+    # 检查源二进制文件是否存在
+    if [ ! -f "${source_binary}" ]; then
+        log_error "源二进制文件未找到: ${source_binary}"
+        return 1
+    fi
+    
+    # 检查是否需要复制（如果目标文件存在且与源文件相同，则跳过）
+    if [ -f "${target_binary}" ]; then
+        if cmp -s "${source_binary}" "${target_binary}"; then
+            log_success "Nginx二进制文件已是最新版本，跳过复制"
+            return 0
+        fi
+    fi
+    
+    log_info "复制Nginx二进制文件到构建目录..."
+    cp "${source_binary}" "${target_binary}" && \
+        log_success "Nginx二进制文件已复制到: ${target_binary}" || \
+        log_error "复制Nginx二进制文件失败"
+}
+
+# 显示编译进度和跳过信息
+show_build_info() {
+    log_info "======================================"
+    log_info "编译信息概述："
+    echo "PCRE编译状态: $([ "$PCRE_COMPILED" = true ] && echo "已完成" || echo "未完成")"
+    echo "ZLIB编译状态: $([ "$ZLIB_COMPILED" = true ] && echo "已完成" || echo "未完成")"
+    echo "LuaJIT编译状态: $([ "$LUAJIT_COMPILED" = true ] && echo "已完成" || echo "未完成")"
+    echo "模块克隆状态: $([ "$MODULES_CLONED" = true ] && echo "已完成" || echo "未完成")"
+    log_info "======================================"
+}
+
+# 主函数
+main() {
+    log_info "Nginx版本: $NGINX_VERSION"
+    
+    # 初始检查各组件状态
+    [ -d "pcre-$PCRE_VERSION" ] && pcre-config --version 2>/dev/null | grep -q "$PCRE_VERSION" && PCRE_COMPILED=true
+    [ -d "zlib-$ZLIB_VERSION" ] && grep -q "ZLIB_VERSION \"$ZLIB_VERSION\"" /usr/local/include/zlib.h 2>/dev/null && ZLIB_COMPILED=true
+    [ -f "/usr/local/lib/libluajit-5.1.so" ] && LUAJIT_COMPILED=true
+    
+    # 检查模块是否已克隆
+    local all_modules=0
+    local existing_modules=0
+    local modules_to_check=("ngx_brotli" "zstd-nginx-module" "openssl" "lua-nginx-module" "ngx_devel_kit")
+    
+    for module in "${modules_to_check[@]}"; do
+        all_modules=$((all_modules + 1))
+        [ -d "$module" ] && existing_modules=$((existing_modules + 1))
+    done
+    [ $all_modules -eq $existing_modules ] && MODULES_CLONED=true
+    
+    # 显示当前状态
+    show_build_info
+    
+    # 执行各步骤，增加检查逻辑避免重复操作
+    install_dependencies
+    install_pcre
+    install_zlib
+    install_luajit
+    clone_modules
+    create_directories
+    compile_nginx
+    copy_nginx_binary
+    
+    log_info "编译过程完成!"
+}
+
+# 执行主函数
+main "$@"
