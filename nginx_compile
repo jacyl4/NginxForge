@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # 版本配置
-NGINX_VERSION="1.27.5"
+NGINX_VERSION="1.29.0"
 PCRE_VERSION="8.45"
 ZLIB_VERSION="1.3.1"
 PROJECT_DIR="$(pwd)"
