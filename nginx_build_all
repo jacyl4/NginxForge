@@ -1,0 +1,155 @@
+#!/bin/bash
+set -uo pipefail
+
+# ============================================================
+# 配置区 - 根据需要修改以下变量
+# ============================================================
+NGINX_VERSION="1.29.3"
+
+# ============================================================
+# 帮助信息
+# ============================================================
+usage() {
+    cat <<'USAGE'
+Usage: nginx_build_all [options]
+
+Options:
+  -a, --arch <list>    Comma-separated or repeated architecture keys (default: all)
+      --skip-deps      Skip dependency installation in all runs
+      --list-targets   Show supported architecture keys
+  -h, --help           Show this help message
+USAGE
+}
+
+# ============================================================
+# 工具函数
+# ============================================================
+log() {
+    local type=$1; shift
+    local GREEN='\033[1;32m' CYAN='\033[1;36m' RED='\033[1;31m'
+    local YELLOW='\033[1;33m' MAGENTA='\033[1;35m' RESET='\033[0m'
+
+    if [ ! -t 1 ]; then
+        printf '[%s] %s\n' "$(echo "$type" | tr '[:lower:]' '[:upper:]')" "$*"
+        return
+    fi
+
+    case $type in
+        info)    printf "${CYAN}[INFO]${RESET} %s\n" "$*" ;;
+        success) printf "${GREEN}[✓]${RESET} %s\n" "$*" ;;
+        warn)    printf "${YELLOW}[!]${RESET} %s\n" "$*" ;;
+        error)   printf "${RED}[✗]${RESET} %s\n" "$*" ;;
+        build)   printf "${MAGENTA}[BUILD]${RESET} %s\n" "$*" ;;
+    esac
+}
+
+# ============================================================
+# 初始化
+# ============================================================
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ARCH_SCRIPT="$SCRIPT_DIR/nginx_build_arch"
+
+if [ ! -x "$ARCH_SCRIPT" ]; then
+    log error "未找到可执行的 nginx_build_arch 脚本: $ARCH_SCRIPT"
+    exit 1
+fi
+
+mapfile -t DEFAULT_TARGETS < <("$ARCH_SCRIPT" --list-targets)
+
+# ============================================================
+# 参数解析
+# ============================================================
+ARCH_LIST=()
+SKIP_DEPS=0
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -a|--arch)
+            value="${2:-}"
+            if [ -z "$value" ]; then
+                log error "--arch 需要参数"
+                usage
+                exit 1
+            fi
+            IFS=',' read -ra split_arch <<< "$value"
+            for item in "${split_arch[@]}"; do
+                [ -z "$item" ] && continue
+                ARCH_LIST+=("$item")
+            done
+            shift 2
+            ;;
+        --skip-deps)
+            SKIP_DEPS=1
+            shift
+            ;;
+        --list-targets)
+            printf '%s\n' "${DEFAULT_TARGETS[@]}"
+            exit 0
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            log error "未知参数: $1"
+            usage
+            exit 1
+            ;;
+    esac
+done
+
+# 如果未指定架构，则构建所有架构
+if [ ${#ARCH_LIST[@]} -eq 0 ]; then
+    ARCH_LIST=("${DEFAULT_TARGETS[@]}")
+fi
+
+# ============================================================
+# 主流程
+# ============================================================
+start_time=$(date +%s)
+log info "开始批量构建 Nginx $NGINX_VERSION，共 ${#ARCH_LIST[@]} 个架构"
+
+declare -a successes=()
+declare -a failures=()
+exit_code=0
+first_run=1
+
+for arch in "${ARCH_LIST[@]}"; do
+    log build "处理架构: $arch"
+    args=("--arch" "$arch")
+    
+    # 首次运行安装依赖，后续跳过（除非用户强制 --skip-deps）
+    if [ $first_run -eq 0 ] || [ $SKIP_DEPS -eq 1 ]; then
+        args+=("--skip-deps")
+    fi
+
+    if "$ARCH_SCRIPT" "${args[@]}"; then
+        successes+=("$arch")
+    else
+        failures+=("$arch")
+        exit_code=1
+    fi
+
+    first_run=0
+    echo
+done
+
+# ============================================================
+# 构建结果统计
+# ============================================================
+log info "构建完成"
+
+if [ ${#successes[@]} -gt 0 ]; then
+    printf '成功 (%s):\n' "${#successes[@]}"
+    printf '  %s\n' "${successes[@]}"
+fi
+
+if [ ${#failures[@]} -gt 0 ]; then
+    printf '失败 (%s):\n' "${#failures[@]}"
+    printf '  %s\n' "${failures[@]}"
+fi
+
+end_time=$(date +%s)
+log info "总耗时 $((end_time - start_time))s ($(((end_time - start_time) / 60))m)"
+
+exit $exit_code
