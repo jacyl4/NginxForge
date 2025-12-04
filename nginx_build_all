@@ -1,25 +1,5 @@
 #!/bin/bash
-set -uo pipefail
-
-# ============================================================
-# 配置区 - 根据需要修改以下变量
-# ============================================================
-NGINX_VERSION="1.29.3"
-
-# ============================================================
-# 帮助信息
-# ============================================================
-usage() {
-    cat <<'USAGE'
-Usage: nginx_build_all [options]
-
-Options:
-  -a, --arch <list>    Comma-separated or repeated architecture keys (default: all)
-      --skip-deps      Skip dependency installation in all runs
-      --list-targets   Show supported architecture keys
-  -h, --help           Show this help message
-USAGE
-}
+set -euo pipefail
 
 # ============================================================
 # 工具函数
@@ -38,20 +18,56 @@ log() {
         info)    printf "${CYAN}[INFO]${RESET} %s\n" "$*" ;;
         success) printf "${GREEN}[✓]${RESET} %s\n" "$*" ;;
         warn)    printf "${YELLOW}[!]${RESET} %s\n" "$*" ;;
-        error)   printf "${RED}[✗]${RESET} %s\n" "$*" ;;
+        error)   printf "${RED}[✗]${RESET} %s\n" "$*" >&2 ;;
         build)   printf "${MAGENTA}[BUILD]${RESET} %s\n" "$*" ;;
+        *)       printf "[%s] %s\n" "$type" "$*" ;;
     esac
 }
 
+error_exit() {
+    local message=$1
+    local code=${2:-1}
+    log error "$message"
+    exit "$code"
+}
+
+cleanup_temp_files() {
+    return 0
+}
+
+error_handler() {
+    local exit_code=$1
+    local line_no=$2
+    log error "脚本在第 ${line_no} 行失败 (退出码: ${exit_code})"
+    cleanup_temp_files || true
+    exit "$exit_code"
+}
+
+trap 'error_handler $? $LINENO' ERR
+umask 022
+
 # ============================================================
-# 初始化
+# 配置与初始化
 # ============================================================
+readonly NGINX_VERSION="1.29.3"
+
+usage() {
+    cat <<'USAGE'
+Usage: nginx_build_all [options]
+
+Options:
+  -a, --arch <list>    Comma-separated or repeated architecture keys (default: all)
+      --skip-deps      Skip dependency installation in all runs
+      --list-targets   Show supported architecture keys
+  -h, --help           Show this help message
+USAGE
+}
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ARCH_SCRIPT="$SCRIPT_DIR/nginx_build_arch"
 
 if [ ! -x "$ARCH_SCRIPT" ]; then
-    log error "未找到可执行的 nginx_build_arch 脚本: $ARCH_SCRIPT"
-    exit 1
+    error_exit "未找到可执行的 nginx_build_arch 脚本: $ARCH_SCRIPT"
 fi
 
 mapfile -t DEFAULT_TARGETS < <("$ARCH_SCRIPT" --list-targets)
@@ -61,95 +77,103 @@ mapfile -t DEFAULT_TARGETS < <("$ARCH_SCRIPT" --list-targets)
 # ============================================================
 ARCH_LIST=()
 SKIP_DEPS=0
+LIST_TARGETS=0
 
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        -a|--arch)
-            value="${2:-}"
-            if [ -z "$value" ]; then
-                log error "--arch 需要参数"
+parse_arguments() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -a|--arch)
+                value="${2:-}"
+                if [ -z "$value" ]; then
+                    log error "--arch 需要参数"
+                    usage
+                    exit 1
+                fi
+                IFS=',' read -ra split_arch <<< "$value"
+                for item in "${split_arch[@]}"; do
+                    [ -z "$item" ] && continue
+                    ARCH_LIST+=("$item")
+                done
+                shift 2
+                ;;
+            --skip-deps)
+                SKIP_DEPS=1
+                shift
+                ;;
+            --list-targets)
+                LIST_TARGETS=1
+                shift
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                log error "未知参数: $1"
                 usage
                 exit 1
-            fi
-            IFS=',' read -ra split_arch <<< "$value"
-            for item in "${split_arch[@]}"; do
-                [ -z "$item" ] && continue
-                ARCH_LIST+=("$item")
-            done
-            shift 2
-            ;;
-        --skip-deps)
-            SKIP_DEPS=1
-            shift
-            ;;
-        --list-targets)
-            printf '%s\n' "${DEFAULT_TARGETS[@]}"
-            exit 0
-            ;;
-        -h|--help)
-            usage
-            exit 0
-            ;;
-        *)
-            log error "未知参数: $1"
-            usage
-            exit 1
-            ;;
-    esac
-done
-
-# 如果未指定架构，则构建所有架构
-if [ ${#ARCH_LIST[@]} -eq 0 ]; then
-    ARCH_LIST=("${DEFAULT_TARGETS[@]}")
-fi
+                ;;
+        esac
+    done
+}
 
 # ============================================================
 # 主流程
 # ============================================================
-start_time=$(date +%s)
-log info "开始批量构建 Nginx $NGINX_VERSION，共 ${#ARCH_LIST[@]} 个架构"
+main() {
+    parse_arguments "$@"
 
-declare -a successes=()
-declare -a failures=()
-exit_code=0
-first_run=1
-
-for arch in "${ARCH_LIST[@]}"; do
-    log build "处理架构: $arch"
-    args=("--arch" "$arch")
-    
-    # 首次运行安装依赖，后续跳过（除非用户强制 --skip-deps）
-    if [ $first_run -eq 0 ] || [ $SKIP_DEPS -eq 1 ]; then
-        args+=("--skip-deps")
+    if [ $LIST_TARGETS -eq 1 ]; then
+        printf '%s\n' "${DEFAULT_TARGETS[@]}"
+        exit 0
     fi
 
-    if "$ARCH_SCRIPT" "${args[@]}"; then
-        successes+=("$arch")
-    else
-        failures+=("$arch")
-        exit_code=1
+    if [ ${#ARCH_LIST[@]} -eq 0 ]; then
+        ARCH_LIST=("${DEFAULT_TARGETS[@]}")
     fi
 
-    first_run=0
-    echo
-done
+    local total=${#ARCH_LIST[@]}
+    local start_time=$(date +%s)
+    log info "开始批量构建 Nginx $NGINX_VERSION，共 ${total} 个架构"
 
-# ============================================================
-# 构建结果统计
-# ============================================================
-log info "构建完成"
+    declare -a successes=()
+    declare -a failures=()
+    local exit_code=0
+    local first_run=1
 
-if [ ${#successes[@]} -gt 0 ]; then
-    printf '成功 (%s):\n' "${#successes[@]}"
-    printf '  %s\n' "${successes[@]}"
-fi
+    for idx in "${!ARCH_LIST[@]}"; do
+        local arch="${ARCH_LIST[$idx]}"
+        log build "[$((idx + 1))/${total}] 处理架构: ${arch}"
+        local args=("--arch" "$arch")
 
-if [ ${#failures[@]} -gt 0 ]; then
-    printf '失败 (%s):\n' "${#failures[@]}"
-    printf '  %s\n' "${failures[@]}"
-fi
+        if [ $first_run -eq 0 ] || [ $SKIP_DEPS -eq 1 ]; then
+            args+=("--skip-deps")
+        fi
 
-end_time=$(date +%s)
-log info "总耗时 $((end_time - start_time))s ($(((end_time - start_time) / 60))m)"
+        if "$ARCH_SCRIPT" "${args[@]}"; then
+            successes+=("$arch")
+        else
+            failures+=("$arch")
+            exit_code=1
+        fi
 
-exit $exit_code
+        first_run=0
+        echo
+    done
+
+    local end_time=$(date +%s)
+    local duration=$((end_time - start_time))
+    log info "构建完成，总耗时 ${duration}s ($((duration / 60))m)"
+
+    if [ ${#successes[@]} -gt 0 ]; then
+        printf '成功 (%s): %s\n' "${#successes[@]}" "${successes[*]}"
+    fi
+
+    if [ ${#failures[@]} -gt 0 ]; then
+        printf '失败 (%s): %s\n' "${#failures[@]}" "${failures[*]}"
+    fi
+
+    exit $exit_code
+}
+
+main "$@"

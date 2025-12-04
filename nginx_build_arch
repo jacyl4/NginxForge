@@ -1,28 +1,120 @@
 #!/bin/bash
 set -euo pipefail
 
-# ============================================================
-# 配置区 - 根据需要修改以下变量
-# ============================================================
-NGINX_VERSION="1.29.3"
+trap 'error_handler $? $LINENO' ERR
+umask 022
 
 # ============================================================
-# 帮助信息
+# 配置区 - 所有可配置项集中在此
 # ============================================================
-usage() {
-    cat <<'EOF'
-Usage: nginx_build_arch --arch <target> [options]
+readonly NGINX_VERSION="1.29.3"
+readonly BORINGSSL_REPO="https://github.com/google/boringssl"
+readonly ZLIB_REPO="https://github.com/cloudflare/zlib"
+readonly BROTLI_REPO="https://github.com/google/ngx_brotli"
+readonly ZSTD_REPO="https://github.com/tokers/zstd-nginx-module"
+readonly NDK_REPO="https://github.com/vision5/ngx_devel_kit"
 
-Options:
-  -a, --arch <target>     Target architecture key (required)
-      --skip-deps         Skip dependency installation
-      --list-targets      List supported architecture keys
-  -h, --help              Show this help message
-EOF
-}
+readonly PROJECT_DIR="$(pwd)"
+readonly BUILD_ROOT="$PROJECT_DIR/compile"
+readonly OUTPUT_ROOT="$PROJECT_DIR/builds"
+readonly BUILD_DIR="$BUILD_ROOT"
+readonly OUTPUT_DIR="$OUTPUT_ROOT/$NGINX_VERSION"
+
+readonly -a TARGETS=(
+    "x86_64_v1"
+    "x86_64_v2"
+    "x86_64_v3"
+    "x86_64_v4"
+    "armv8"
+    "armv8_crc"
+    "armv8_crypto"
+    "armv8.2"
+    "armv8.4"
+    "armv9"
+)
+
+declare -Ar ARCH_CONFIG=(
+    ["x86_64_v1"]="x86_64-linux-gnu:x86_64:amd64:-march=x86-64"
+    ["x86_64_v2"]="x86_64-linux-gnu:x86_64:amd64:-march=x86-64-v2"
+    ["x86_64_v3"]="x86_64-linux-gnu:x86_64:amd64:-march=x86-64-v3"
+    ["x86_64_v4"]="x86_64-linux-gnu:x86_64:amd64:-march=x86-64-v4"
+    ["armv8"]="aarch64-linux-gnu:aarch64:arm64:-march=armv8-a"
+    ["armv8_crc"]="aarch64-linux-gnu:aarch64:arm64:-march=armv8-a+crc"
+    ["armv8_crypto"]="aarch64-linux-gnu:aarch64:arm64:-march=armv8-a+crc+crypto"
+    ["armv8.2"]="aarch64-linux-gnu:aarch64:arm64:-march=armv8.2-a"
+    ["armv8.4"]="aarch64-linux-gnu:aarch64:arm64:-march=armv8.4-a"
+    ["armv9"]="aarch64-linux-gnu:aarch64:arm64:-march=armv9-a"
+)
+
+readonly NGINX_CONFIGURE_ARGS=(
+    --prefix=/etc/nginx
+    --sbin-path=/usr/sbin/nginx
+    --modules-path=/usr/lib/nginx/modules
+    --conf-path=/etc/nginx/nginx.conf
+    --error-log-path=/var/log/nginx/error.log
+    --http-log-path=/var/log/nginx/access.log
+    --pid-path=/run/nginx.pid
+    --lock-path=/run/nginx.lock
+    --http-client-body-temp-path=/var/cache/nginx/client_temp
+    --http-proxy-temp-path=/var/cache/nginx/proxy_temp
+    --http-fastcgi-temp-path=/var/cache/nginx/fastcgi_temp
+    --http-uwsgi-temp-path=/var/cache/nginx/uwsgi_temp
+    --http-scgi-temp-path=/var/cache/nginx/scgi_temp
+    --user=www-data
+    --group=www-data
+    --with-compat
+    --with-file-aio
+    --with-threads
+    --with-libatomic
+    --with-http_ssl_module
+    --with-http_v2_module
+    --with-http_v3_module
+    --with-http_realip_module
+    --with-http_addition_module
+    --with-http_sub_module
+    --with-http_dav_module
+    --with-http_flv_module
+    --with-http_mp4_module
+    --with-http_gunzip_module
+    --with-http_gzip_static_module
+    --with-http_auth_request_module
+    --with-http_random_index_module
+    --with-http_secure_link_module
+    --with-http_degradation_module
+    --with-http_slice_module
+    --with-http_stub_status_module
+    --with-stream
+    --with-stream_ssl_module
+    --with-stream_ssl_preread_module
+    --with-stream_realip_module
+    --with-pcre-jit
+)
+
+readonly BASE_CFLAGS="-O3 -pipe -fstack-protector-strong -fPIC -D_FORTIFY_SOURCE=2 -DTCP_FASTOPEN=23"
+readonly BASE_LDFLAGS="-Wl,-z,relro,-z,now,--as-needed"
 
 # ============================================================
-# 工具函数
+# 参数、状态
+# ============================================================
+ARCH=""
+SKIP_DEPS=0
+LIST_TARGETS=0
+
+CROSS_PREFIX=""
+IS_NATIVE=0
+TOOLCHAIN_AVAILABLE=0
+MISSING_TOOL=""
+CC="gcc"
+CXX="g++"
+AR="ar"
+RANLIB="ranlib"
+STRIP="strip"
+MARCH_FLAGS=""
+CMAKE_ARCH=""
+DPKG_ARCH=""
+
+# ============================================================
+# 工具函数区
 # ============================================================
 log() {
     local type=$1; shift
@@ -40,136 +132,120 @@ log() {
         warn)    printf "${YELLOW}[!]${RESET} %s\n" "$*" ;;
         error)   printf "${RED}[✗]${RESET} %s\n" "$*" >&2 ;;
         build)   printf "${MAGENTA}[BUILD]${RESET} %s\n" "$*" ;;
+        *)       printf "[%s] %s\n" "$type" "$*" ;;
     esac
 }
 
-# ============================================================
-# 目录配置
-# ============================================================
-PROJECT_DIR="$(pwd)"
-BUILD_ROOT="$PROJECT_DIR/compile"
-OUTPUT_ROOT="$PROJECT_DIR/builds"
+error_exit() {
+    local message=$1
+    local code=${2:-1}
+    log error "$message"
+    exit "$code"
+}
+
+cleanup_temp_files() {
+    return 0
+}
+
+error_handler() {
+    local exit_code=$1
+    local line_no=$2
+    log error "脚本在第 ${line_no} 行失败 (退出码: ${exit_code})"
+    cleanup_temp_files || true
+    exit "$exit_code"
+}
+
+safe_execute() {
+    local description=$1
+    shift
+
+    log info "$description"
+    if ! "$@"; then
+        log error "$description 失败"
+        return 1
+    fi
+}
 
 # ============================================================
-# 架构配置
+# 帮助与参数解析区
 # ============================================================
-declare -a TARGETS=(
-    "x86_64_v1"
-    "x86_64_v2"
-    "x86_64_v3"
-    "x86_64_v4"
-    "armv8"
-    "armv8_crc"
-    "armv8_crypto"
-    "armv8.2"
-    "armv8.4"
-    "armv9"
-)
+usage() {
+    cat <<'EOF'
+Usage: nginx_build_arch --arch <target> [options]
 
-declare -A ARCH_CONFIG=(
-    ["x86_64_v1"]="x86_64-linux-gnu:x86_64:amd64:-march=x86-64"
-    ["x86_64_v2"]="x86_64-linux-gnu:x86_64:amd64:-march=x86-64-v2"
-    ["x86_64_v3"]="x86_64-linux-gnu:x86_64:amd64:-march=x86-64-v3"
-    ["x86_64_v4"]="x86_64-linux-gnu:x86_64:amd64:-march=x86-64-v4"
-    ["armv8"]="aarch64-linux-gnu:aarch64:arm64:-march=armv8-a"
-    ["armv8_crc"]="aarch64-linux-gnu:aarch64:arm64:-march=armv8-a+crc"
-    ["armv8_crypto"]="aarch64-linux-gnu:aarch64:arm64:-march=armv8-a+crc+crypto"
-    ["armv8.2"]="aarch64-linux-gnu:aarch64:arm64:-march=armv8.2-a"
-    ["armv8.4"]="aarch64-linux-gnu:aarch64:arm64:-march=armv8.4-a"
-    ["armv9"]="aarch64-linux-gnu:aarch64:arm64:-march=armv9-a"
-)
+Options:
+  -a, --arch <target>     Target architecture key (required)
+      --skip-deps         Skip dependency installation
+      --list-targets      List supported architecture keys
+  -h, --help              Show this help message
+EOF
+}
 
-# ============================================================
-# 参数解析
-# ============================================================
-ARCH=""
-SKIP_DEPS=0
-LIST_TARGETS=0
+parse_arguments() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -a|--arch)
+                ARCH="${2:-}"
+                shift 2
+                ;;
+            --skip-deps)
+                SKIP_DEPS=1
+                shift
+                ;;
+            --list-targets)
+                LIST_TARGETS=1
+                shift
+                ;;
+            -h|--help)
+                usage
+                exit 0
+                ;;
+            *)
+                log error "未知参数: $1"
+                usage
+                exit 1
+                ;;
+        esac
+    done
 
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        -a|--arch)
-            ARCH="${2:-}"
-            shift 2
-            ;;
-        --skip-deps)
-            SKIP_DEPS=1
-            shift
-            ;;
-        --list-targets)
-            LIST_TARGETS=1
-            shift
-            ;;
-        -h|--help)
-            usage
-            exit 0
-            ;;
-        *)
-            log error "未知参数: $1"
-            usage
-            exit 1
-            ;;
-    esac
-done
+    if [ $LIST_TARGETS -eq 1 ]; then
+        printf '%s\n' "${TARGETS[@]}"
+        exit 0
+    fi
 
-if [ $LIST_TARGETS -eq 1 ]; then
-    printf '%s\n' "${TARGETS[@]}"
-    exit 0
-fi
+    if [ -z "$ARCH" ]; then
+        log error "必须指定 --arch"
+        usage
+        exit 1
+    fi
 
-if [ -z "$ARCH" ]; then
-    log error "必须指定 --arch"
-    usage
-    exit 1
-fi
-
-if [[ -z "${ARCH_CONFIG[$ARCH]:-}" ]]; then
-    log error "不支持的架构: $ARCH"
-    printf '可用架构:\n' >&2
-    printf '  %s\n' "${TARGETS[@]}" >&2
-    exit 1
-fi
+    if [[ -z "${ARCH_CONFIG[$ARCH]:-}" ]]; then
+        log error "不支持的架构: $ARCH"
+        printf '可用架构:\n' >&2
+        printf '  %s\n' "${TARGETS[@]}" >&2
+        exit 1
+    fi
+}
 
 # ============================================================
-# 构建目录
+# 工具链管理区
 # ============================================================
-BUILD_DIR="$BUILD_ROOT"
-OUTPUT_DIR="$OUTPUT_ROOT/$NGINX_VERSION"
+create_build_directories() {
+    mkdir -p "$BUILD_DIR" "$OUTPUT_DIR"
+}
 
-umask 022
-
-# ============================================================
-# 工具链变量（由 parse_arch 函数初始化）
-# ============================================================
-CROSS_PREFIX=""
-IS_NATIVE=0
-TOOLCHAIN_AVAILABLE=0
-MISSING_TOOL=""
-CC="gcc"
-CXX="g++"
-AR="ar"
-RANLIB="ranlib"
-STRIP="strip"
-MARCH_FLAGS=""
-CMAKE_ARCH=""
-DPKG_ARCH=""
-
-# ============================================================
-# 核心函数
-# ============================================================
-parse_arch() {
+detect_and_setup_toolchain() {
     local arch=$1
     local config="${ARCH_CONFIG[$arch]}"
     IFS=':' read -r CROSS_PREFIX CMAKE_ARCH DPKG_ARCH MARCH_FLAGS <<< "$config"
 
     TOOLCHAIN_AVAILABLE=1
     MISSING_TOOL=""
+    IS_NATIVE=0
 
     if [ "$CROSS_PREFIX" = "x86_64-linux-gnu" ] && [ "$(uname -m)" = "x86_64" ]; then
         CROSS_PREFIX=""
         IS_NATIVE=1
-    else
-        IS_NATIVE=0
     fi
 
     if [ -n "$CROSS_PREFIX" ]; then
@@ -195,6 +271,16 @@ parse_arch() {
     done
 }
 
+validate_toolchain() {
+    if [ $TOOLCHAIN_AVAILABLE -eq 0 ]; then
+        log error "缺少交叉编译工具: $MISSING_TOOL"
+        return 1
+    fi
+}
+
+# ============================================================
+# 环境准备区
+# ============================================================
 install_deps() {
     if [ $SKIP_DEPS -eq 1 ]; then
         log info "跳过依赖安装"
@@ -215,7 +301,7 @@ install_deps() {
     fi
 
     if [ $has_apt -eq 1 ] && [ $is_root -eq 1 ]; then
-        apt update
+        safe_execute "更新软件源" apt update
         DEBIAN_FRONTEND=noninteractive apt install -y --no-install-recommends \
             ca-certificates wget curl git build-essential cmake \
             libpcre2-dev zlib1g-dev libatomic-ops-dev libbrotli-dev libzstd-dev \
@@ -234,56 +320,33 @@ install_deps() {
     fi
 }
 
-prepare_sources() {
+# ============================================================
+# 源码管理区
+# ============================================================
+ensure_git_repo() {
+    local dir=$1
+    local url=$2
+    shift 2
+    local extra_flags=("$@")
+
+    if [ -d "$dir/.git" ]; then
+        return 0
+    fi
+
+    rm -rf "$dir"
+    safe_execute "克隆 $(basename "$dir")" git clone --depth=1 "${extra_flags[@]}" "$url" "$dir"
+}
+
+clone_dependency_sources() {
     mkdir -p "$BUILD_DIR"
-
     (
         cd "$BUILD_DIR"
-
-        if [ ! -d boringssl-src/.git ]; then
-            log info "准备 BoringSSL 源码..."
-            rm -rf boringssl-src
-            git clone --depth=1 https://github.com/google/boringssl boringssl-src >/dev/null 2>&1
-            log success "BoringSSL 源码就绪"
-        fi
-
-        if [ ! -d zlib-src/.git ]; then
-            log info "准备 zlib 源码..."
-            rm -rf zlib-src
-            git clone --depth=1 https://github.com/cloudflare/zlib zlib-src >/dev/null 2>&1
-            log success "zlib 源码就绪"
-        fi
+        ensure_git_repo "boringssl-src" "$BORINGSSL_REPO"
+        ensure_git_repo "zlib-src" "$ZLIB_REPO"
     )
 }
 
-clone_modules() {
-    (
-        cd "$BUILD_DIR"
-
-        if [ ! -d ngx_brotli/.git ]; then
-            log info "克隆 ngx_brotli 模块..."
-            rm -rf ngx_brotli
-            git clone --depth=1 --recurse-submodules https://github.com/google/ngx_brotli >/dev/null 2>&1
-            log success "ngx_brotli 准备完成"
-        fi
-
-        if [ ! -d zstd-nginx-module/.git ]; then
-            log info "克隆 zstd-nginx-module 模块..."
-            rm -rf zstd-nginx-module
-            git clone --depth=1 --recurse-submodules https://github.com/tokers/zstd-nginx-module >/dev/null 2>&1
-            log success "zstd 模块准备完成"
-        fi
-
-        if [ ! -d ngx_devel_kit/.git ]; then
-            log info "克隆 ngx_devel_kit 模块..."
-            rm -rf ngx_devel_kit
-            git clone --depth=1 https://github.com/vision5/ngx_devel_kit >/dev/null 2>&1
-            log success "ngx_devel_kit 准备完成"
-        fi
-    )
-}
-
-download_nginx() {
+download_nginx_source() {
     mkdir -p "$BUILD_DIR"
     local version_file="$BUILD_DIR/.nginx-version"
 
@@ -297,15 +360,15 @@ download_nginx() {
     fi
 
     log info "下载 Nginx $NGINX_VERSION..."
-    wget -qO /tmp/nginx.tar.gz "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz"
-    tar -zxf /tmp/nginx.tar.gz -C "$BUILD_DIR"
+    safe_execute "获取 Nginx 源码" wget -qO /tmp/nginx.tar.gz "https://nginx.org/download/nginx-${NGINX_VERSION}.tar.gz"
+    safe_execute "解压 Nginx 源码" tar -zxf /tmp/nginx.tar.gz -C "$BUILD_DIR"
     mv "$BUILD_DIR/nginx-${NGINX_VERSION}" "$BUILD_DIR/nginx-src"
     rm /tmp/nginx.tar.gz
     echo "$NGINX_VERSION" > "$version_file"
     log success "Nginx 源码下载完成"
 }
 
-patch_nginx() {
+apply_nginx_patches() {
     local src="$BUILD_DIR/nginx-src"
     [ -d "$src" ] || return
 
@@ -331,10 +394,24 @@ patch_nginx() {
     )
 }
 
+clone_third_party_modules() {
+    mkdir -p "$BUILD_DIR"
+    (
+        cd "$BUILD_DIR"
+        ensure_git_repo "ngx_brotli" "$BROTLI_REPO" --recurse-submodules
+        ensure_git_repo "zstd-nginx-module" "$ZSTD_REPO" --recurse-submodules
+        ensure_git_repo "ngx_devel_kit" "$NDK_REPO"
+    )
+}
+
+# ============================================================
+# 依赖库构建区
+# ============================================================
 build_boringssl() {
     local name="boringssl-${ARCH}"
 
     if [ -d "$BUILD_DIR/$name/.openssl" ]; then
+        log info "BoringSSL 缓存命中: $ARCH"
         return 0
     fi
 
@@ -343,13 +420,13 @@ build_boringssl() {
     (
         cd "$BUILD_DIR"
         rm -rf "$name"
-        cp -r boringssl-src "$name"
+        safe_execute "复制 BoringSSL 源码 ($ARCH)" cp -r boringssl-src "$name"
         cd "$name"
 
         local cmake_flags=(
             -DCMAKE_BUILD_TYPE=Release
-            "-DCMAKE_C_FLAGS=-O3 $MARCH_FLAGS"
-            "-DCMAKE_CXX_FLAGS=-O3 $MARCH_FLAGS"
+            "-DCMAKE_C_FLAGS=${BASE_CFLAGS} ${MARCH_FLAGS}"
+            "-DCMAKE_CXX_FLAGS=${BASE_CFLAGS} ${MARCH_FLAGS}"
         )
 
         if [ $IS_NATIVE -eq 0 ]; then
@@ -364,8 +441,8 @@ build_boringssl() {
         mkdir build
         (
             cd build
-            cmake "${cmake_flags[@]}" .. >/dev/null 2>&1
-            make -j "$(nproc)" >/dev/null 2>&1
+            safe_execute "生成 BoringSSL 构建文件 ($ARCH)" cmake "${cmake_flags[@]}" ..
+            safe_execute "编译 BoringSSL ($ARCH)" make -j "$(nproc)"
         )
 
         mkdir -p .openssl/{lib,include}
@@ -377,6 +454,7 @@ build_boringssl() {
 clean:
 install_sw:
 MAKE
+
         printf '#!/bin/sh\nexit 0\n' > .openssl/config
         chmod +x .openssl/config
     )
@@ -388,6 +466,7 @@ build_zlib() {
     local name="zlib-${ARCH}"
 
     if [ -f "$BUILD_DIR/$name/libz.a" ]; then
+        log info "zlib 缓存命中: $ARCH"
         return 0
     fi
 
@@ -396,7 +475,7 @@ build_zlib() {
     (
         cd "$BUILD_DIR"
         rm -rf "$name"
-        cp -r zlib-src "$name"
+        safe_execute "复制 zlib 源码 ($ARCH)" cp -r zlib-src "$name"
         cd "$name"
 
         if [ $IS_NATIVE -eq 0 ]; then
@@ -406,120 +485,140 @@ build_zlib() {
             CFLAGS="$MARCH_FLAGS -O3 -fomit-frame-pointer" ./configure >/dev/null 2>&1
         fi
 
-        make -j "$(nproc)" libz.a >/dev/null 2>&1
+        safe_execute "编译 zlib ($ARCH)" make -j "$(nproc)" libz.a
     )
 
     log success "zlib: $ARCH 完成"
 }
 
-build_nginx() {
-    log build "Nginx: $ARCH"
+build_dependencies_parallel() {
+    log info "并行构建依赖库..."
 
-    local dir="$BUILD_DIR/nginx-build-${ARCH}"
+    build_boringssl &
+    local pid_boringssl=$!
 
-    (
-        cd "$BUILD_DIR"
-        rm -rf "$dir"
-        cp -r nginx-src "$dir"
-    )
+    build_zlib &
+    local pid_zlib=$!
 
-    (
-        cd "$dir"
+    local failed=0
 
-        sed -i '/cd \$OPENSSL/,/^$/c\	touch \$OPENSSL/.openssl/include/openssl/ssl.h' auto/lib/openssl/make
-        sed -i 's/&& \$(MAKE) distclean//' auto/lib/zlib/make
+    if ! wait "$pid_boringssl"; then
+        log error "BoringSSL 构建失败"
+        failed=1
+    fi
 
-        local ssl_dir="$BUILD_DIR/boringssl-${ARCH}"
-        local zlib_dir="$BUILD_DIR/zlib-${ARCH}"
+    if ! wait "$pid_zlib"; then
+        log error "zlib 构建失败"
+        failed=1
+    fi
 
-        local cflags="$MARCH_FLAGS -O3 -pipe -fstack-protector-strong -fPIC -D_FORTIFY_SOURCE=2 -DTCP_FASTOPEN=23 -I${ssl_dir}/.openssl/include"
-        local ldflags="-Wl,-z,relro,-z,now,--as-needed -L${ssl_dir}/.openssl/lib -lstdc++"
-
-        if [ $IS_NATIVE -eq 1 ] && [[ "$ARCH" == x86_64_* ]]; then
-            cflags="$cflags -flto"
-            ldflags="$ldflags -lmimalloc -flto"
-        fi
-
-        ./configure \
-          --prefix=/etc/nginx --sbin-path=/usr/sbin/nginx \
-          --modules-path=/usr/lib/nginx/modules --conf-path=/etc/nginx/nginx.conf \
-          --error-log-path=/var/log/nginx/error.log --http-log-path=/var/log/nginx/access.log \
-          --pid-path=/run/nginx.pid --lock-path=/run/nginx.lock \
-          --http-client-body-temp-path=/var/cache/nginx/client_temp \
-          --http-proxy-temp-path=/var/cache/nginx/proxy_temp \
-          --http-fastcgi-temp-path=/var/cache/nginx/fastcgi_temp \
-          --http-uwsgi-temp-path=/var/cache/nginx/uwsgi_temp \
-          --http-scgi-temp-path=/var/cache/nginx/scgi_temp \
-          --user=www-data --group=www-data \
-          --with-compat --with-file-aio --with-threads --with-libatomic \
-          --with-http_ssl_module --with-http_v2_module --with-http_v3_module \
-          --with-http_realip_module --with-http_addition_module --with-http_sub_module \
-          --with-http_dav_module --with-http_flv_module --with-http_mp4_module \
-          --with-http_gunzip_module --with-http_gzip_static_module \
-          --with-http_auth_request_module --with-http_random_index_module \
-          --with-http_secure_link_module --with-http_degradation_module \
-          --with-http_slice_module --with-http_stub_status_module \
-          --with-stream --with-stream_ssl_module --with-stream_ssl_preread_module \
-          --with-stream_realip_module --with-pcre-jit \
-          --with-zlib="$zlib_dir" \
-          --add-module=$BUILD_DIR/ngx_brotli \
-          --add-module=$BUILD_DIR/zstd-nginx-module \
-          --add-module=$BUILD_DIR/ngx_devel_kit \
-          --with-openssl="$ssl_dir" \
-          --with-cc="$CC" --with-cpp="$CXX" \
-          --with-cc-opt="$cflags" --with-ld-opt="$ldflags" >/dev/null 2>&1 || {
-              log error "Nginx 配置失败: $ARCH"
-              exit 1
-          }
-
-        if [ $IS_NATIVE -eq 1 ] && [[ "$ARCH" == x86_64_* ]]; then
-            sed -i 's/-latomic_ops/-latomic_ops -lmimalloc -lstdc++/' objs/Makefile
-        else
-            sed -i 's/-latomic_ops/-latomic_ops -lstdc++/' objs/Makefile
-        fi
-
-        make -j "$(nproc)" >/dev/null 2>&1 || {
-            log error "Nginx 编译失败: $ARCH"
-            exit 1
-        }
-
-        if [ -f objs/nginx ]; then
-            "$STRIP" objs/nginx
-            mkdir -p "$OUTPUT_DIR"
-            cp objs/nginx "$OUTPUT_DIR/nginx-${ARCH}"
-            local size
-            size=$(ls -lh "$OUTPUT_DIR/nginx-${ARCH}" | awk '{print $5}')
-            log success "Nginx: $ARCH 完成 ($size)"
-        else
-            log error "Nginx 二进制未生成: $ARCH"
-            exit 1
-        fi
-    )
+    return $failed
 }
 
 # ============================================================
-# 主流程
+# Nginx 构建区
+# ============================================================
+configure_nginx() {
+    local build_dir=$1
+    local ssl_dir="$BUILD_DIR/boringssl-${ARCH}"
+    local zlib_dir="$BUILD_DIR/zlib-${ARCH}"
+
+    cd "$build_dir"
+
+    sed -i '/cd \$OPENSSL/,/^$/c\	touch \$OPENSSL/.openssl/include/openssl/ssl.h' auto/lib/openssl/make
+    sed -i 's/&& \$(MAKE) distclean//' auto/lib/zlib/make
+
+    local cflags="$MARCH_FLAGS ${BASE_CFLAGS} -I${ssl_dir}/.openssl/include"
+    local ldflags="${BASE_LDFLAGS} -L${ssl_dir}/.openssl/lib -lstdc++"
+
+    if [ $IS_NATIVE -eq 1 ] && [[ "$ARCH" == x86_64_* ]]; then
+        cflags="$cflags -flto"
+        ldflags="$ldflags -lmimalloc -flto"
+    fi
+
+    local configure_args=(
+        "${NGINX_CONFIGURE_ARGS[@]}"
+        --with-zlib="$zlib_dir"
+        --add-module="$BUILD_DIR/ngx_brotli"
+        --add-module="$BUILD_DIR/zstd-nginx-module"
+        --add-module="$BUILD_DIR/ngx_devel_kit"
+        --with-openssl="$ssl_dir"
+        --with-cc="$CC"
+        --with-cpp="$CXX"
+        --with-cc-opt="$cflags"
+        --with-ld-opt="$ldflags"
+    )
+
+    safe_execute "配置 Nginx ($ARCH)" ./configure "${configure_args[@]}"
+}
+
+compile_nginx() {
+    local build_dir=$1
+    cd "$build_dir"
+
+    if [ $IS_NATIVE -eq 1 ] && [[ "$ARCH" == x86_64_* ]]; then
+        sed -i 's/-latomic_ops/-latomic_ops -lmimalloc -lstdc++/' objs/Makefile
+    else
+        sed -i 's/-latomic_ops/-latomic_ops -lstdc++/' objs/Makefile
+    fi
+
+    safe_execute "编译 Nginx ($ARCH)" make -j "$(nproc)"
+}
+
+strip_and_copy_binary() {
+    local build_dir=$1
+    cd "$build_dir"
+
+    if [ ! -f objs/nginx ]; then
+        error_exit "Nginx 二进制未生成: $ARCH"
+    fi
+
+    "$STRIP" objs/nginx
+    mkdir -p "$OUTPUT_DIR"
+    cp objs/nginx "$OUTPUT_DIR/nginx-${ARCH}"
+    local size
+    size=$(ls -lh "$OUTPUT_DIR/nginx-${ARCH}" | awk '{print $5}')
+    log success "Nginx: $ARCH 完成 ($size)"
+}
+
+build_nginx() {
+    log build "Nginx: $ARCH"
+    local build_dir="$BUILD_DIR/nginx-build-${ARCH}"
+
+    (
+        cd "$BUILD_DIR"
+        rm -rf "$build_dir"
+        safe_execute "复制 Nginx 源码 ($ARCH)" cp -r nginx-src "$build_dir"
+    )
+
+    configure_nginx "$build_dir"
+    compile_nginx "$build_dir"
+    strip_and_copy_binary "$build_dir"
+}
+
+# ============================================================
+# 主流程区
 # ============================================================
 main() {
-    mkdir -p "$BUILD_DIR" "$OUTPUT_DIR"
+    parse_arguments "$@"
+    log info "准备编译 Nginx $NGINX_VERSION ($ARCH)"
 
-    # 解析架构配置并检查工具链
-    parse_arch "$ARCH"
-    if [ $TOOLCHAIN_AVAILABLE -eq 0 ]; then
-        log error "缺少交叉编译工具: $MISSING_TOOL"
+    create_build_directories
+    detect_and_setup_toolchain "$ARCH"
+    if ! validate_toolchain; then
         return 1
     fi
 
-    # 准备构建环境
     install_deps
-    prepare_sources
-    download_nginx
-    patch_nginx
-    clone_modules
+    clone_dependency_sources
+    download_nginx_source
+    apply_nginx_patches
+    clone_third_party_modules
 
-    # 构建依赖和 Nginx
-    build_boringssl
-    build_zlib
+    if ! build_dependencies_parallel; then
+        error_exit "依赖库构建失败"
+    fi
+
     build_nginx
 
     log success "全部完成！产物位于 $OUTPUT_DIR/nginx-${ARCH}"
@@ -529,12 +628,10 @@ main() {
 # 执行主流程
 # ============================================================
 start_time=$(date +%s)
-log info "准备编译 Nginx $NGINX_VERSION ($ARCH)"
-
-if main; then
+if main "$@"; then
     end_time=$(date +%s)
     duration=$((end_time - start_time))
-    log success "耗时 ${duration}s ($((${duration} / 60))m)"
+    log success "耗时 ${duration}s ($((duration / 60))m)"
 else
     status=$?
     exit $status
