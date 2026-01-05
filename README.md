@@ -383,10 +383,6 @@ sudo apt install -y libmimalloc2.0
 
 ---
 
-## 🤝 贡献
-
-欢迎提交 Issue 和 Pull Request！
-
 ### 添加新架构
 1. 编辑 `nginx_build_arch` 配置区
 2. 在 `TARGETS` 数组添加架构名
